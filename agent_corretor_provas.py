@@ -1,19 +1,27 @@
 import base64
 from typing import List
 import operator
+import tempfile
 
 import streamlit as st
 from pydantic import BaseModel
 from typing_extensions import Annotated
+from dotenv import load_dotenv
 
 from langchain.chat_models import init_chat_model
+from langchain.schema import Document
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores.faiss import FAISS
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
-from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import (
+    RunnableLambda,
+    RunnableParallel,
+    RunnablePassthrough,
+)
 
 ########################### MODELOS ###########################
 
@@ -27,6 +35,7 @@ class P_e_R(BaseModel):
 
 
 class ProvaState(BaseModel):
+    documento: str = None
     instrucoes: str = None
     imagens: List[str] = None
     prova: List[P_e_R] = None
@@ -35,6 +44,7 @@ class ProvaState(BaseModel):
 
 
 ########################### LLM ###########################
+load_dotenv()
 
 llm = init_chat_model("gpt-4o")
 llm_estruturado = llm.with_structured_output(ProvaState)
@@ -125,25 +135,60 @@ def extrair_perguntas_respostas(state: ProvaState):
 
 
 def spawn_correcao(state: ProvaState):
-    return [Send("corrigir_prova", p_r) for p_r in state.prova]
+    return [
+        Send("corrigir_prova", {"dados": p_r, "documento": state.documento})
+        for p_r in state.prova
+    ]
 
 
-def corrigir_prova(dados: P_e_R):
-    prompt = f""" Você é um professor especialista em corrigir provas escolares.
-                  Aqui estão os detalhes da questão:
-                  Pergunta: {dados.pergunta}
-                  Resposta do aluno: {dados.resposta}
-                  Peso da questão: {dados.peso}
+def join_documents(input):
+    input["contexto"] = "\n\n".join([c.page_content for c in input["contexto"]])
+    return input
 
-                  Sua tarefa:
-                  - Analisar a resposta do aluno                  
-                  - SEMPRE Fornecer um feedback claro e construtivo, se a resposta do aluno estiver errada ou partialmente correta explique o porquê
-                  - SEMPRE fornecer um feedback, mesmo que a resposta esteja correta
-                  - SEMPRE fornecer feedback, mesmo que o peso ou valor da questão nao tenho sido inofrmado
-                  - Atribuir uma nota entre 0 e o peso
-                  Retorne os campos estruturados como:
-                  - pergunta, resposta, feedback, nota, peso
-    """
+
+def corrigir_prova(inputs: dict):
+    dados = inputs["dados"]
+    documento = inputs.get("documento", "")
+
+    if documento != "":
+        # Divide o texto em chunks
+        split_text = RAG_text_splitting(documento)
+
+        # Cria os documentos
+        docs = [Document(page_content=chunk) for chunk in split_text]
+
+        # Cria o retriever
+        vector_store = RAG_embeddings_vector_store_as_retriever(docs)
+        retriever = vector_store.as_retriever(
+            search_type="mmr", search_kwargs={"k": 5, "fetch_k": 20}
+        )
+
+        # Recupera os documentos mais relevantes com base na pergunta
+        context_docs = retriever.invoke(dados.pergunta)
+        contexto = "\n\n".join([doc.page_content for doc in context_docs])
+
+    else:
+        contexto = "Não há contexto adicional."
+
+    # Prompt final (usando ou não o contexto)
+    prompt = f"""Você é um professor especialista em corrigir provas escolares e em dar feedbacks construtivos.
+                Aqui estão os detalhes da questão:
+                Pergunta: {dados.pergunta}
+                Resposta do aluno: {dados.resposta}
+                Peso da questão: {dados.peso}
+
+                Contexto adicional para basear sua correção:
+                {contexto}
+
+                Sua tarefa:
+                - Analisar a resposta do aluno                  
+                - SEMPRE fornecer um feedback claro e construtivo, mesmo que a resposta esteja correta
+                - Se a resposta estiver errada ou parcialmente correta, explique o porquê
+                - Atribua uma nota entre 0 e o peso
+                Retorne os campos estruturados como:
+                - pergunta, resposta, feedback, nota, peso
+            """
+
     response = llm_estruturado.invoke(prompt)
     return {"prova_corrigida": response.prova}
 
@@ -167,7 +212,7 @@ def main():
     st.set_page_config("IA Corretor de Provas", layout="wide")
     st.title("📝 IA Corretor de Provas")
 
-    col1, col2 = st.columns([2, 3])
+    col1, col2, col3, col4 = st.columns([3, 2, 3, 2])
 
     with col1:
         st.header("Instruções")
@@ -187,6 +232,18 @@ def main():
 
         st.divider()
         corrigir = st.button("Corrigir Prova")
+    with col3:
+        st.header("Ajuste fino")
+        arquivos_RAG = st.file_uploader(
+            "📷 Envie um  (JPG, JPEG, PNG)",
+            type=["txt", "pdf"],
+        )
+        if arquivos_RAG is not None:
+            suffix = "." + arquivos_RAG.name.split(".")[-1]
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp:
+                temp.write(arquivos_RAG.read())
+                caminho_temp = temp.name
+            documento = RAG_document_loaders(caminho_temp)
 
     if corrigir and arquivos:
         imagens_base64 = []
@@ -201,7 +258,8 @@ def main():
                 "instrucoes": instrucoes,
                 "imagens": imagens_base64,
             }
-
+            if arquivos_RAG:
+                estado_inicial["documento"] = documento
             resposta = graph.invoke(estado_inicial)
 
         st.success("✅ Correção finalizada!")
