@@ -233,9 +233,12 @@ def main():
         st.divider()
         corrigir = st.button("Corrigir Prova")
     with col3:
-        st.header("Ajuste fino")
+        st.header("Ajuste fino(RAG)")
+        st.markdown(
+            "Para uma correção mais acertiva, envia as respostas das perguntas no campo abaixo"
+        )
         arquivos_RAG = st.file_uploader(
-            "📷 Envie um  (JPG, JPEG, PNG)",
+            "📷 Envie um  (TXT, PDF)",
             type=["txt", "pdf"],
         )
         if arquivos_RAG is not None:
