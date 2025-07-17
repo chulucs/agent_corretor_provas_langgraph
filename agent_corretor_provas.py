@@ -263,6 +263,9 @@ def main():
             }
             if arquivos_RAG:
                 estado_inicial["documento"] = documento
+            else:
+                estado_inicial["documento"] = ""
+
             resposta = graph.invoke(estado_inicial)
 
         st.success("✅ Correção finalizada!")
